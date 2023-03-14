@@ -317,7 +317,6 @@ class VariableInput {
             return this._value.isAlwaysNumber();
         }
         return this.type === TYPE_NUMBER;
-//        return false;
     }
 
     isAlwaysNumberOrNaN () {
@@ -325,7 +324,6 @@ class VariableInput {
             return this._value.isAlwaysNumberOrNaN();
         }
         return this.type === TYPE_NUMBER || this.type === TYPE_NUMBER_NAN;
-//        return false;
     }
 
     isNeverNumber () {
@@ -415,6 +413,15 @@ class JSGenerator {
          * @type {Frame}
          */
         this.currentFrame = null;
+
+        /**
+         * A cache of variable types of previously
+         * explored branches
+         * Used because nested blocks very well may
+         * search through things multiple times
+         * @type {Map<*,Frame>}
+         */
+        this.branchTypeMap = new Map();
 
         this.namesOfCostumesAndSounds = getNamesOfCostumesAndSounds(target.runtime);
 
@@ -842,12 +849,15 @@ class JSGenerator {
             break;
         }
         case 'control.wait': {
-            // Can yield, but shouldn't ever
+            if (this.warpTimer || !this.isWarp) {
+                this.resetVariableInputs();
+            }
             break;
         }
         case 'control.waitUntil': {
-            // Same as control.wait -- Can yield,
-            // but we shouldn't ever get here if it does
+            if (this.warpTimer || !this.isWarp) {
+                this.resetVariableInputs();
+            }
             break;
         }
         case 'control.while': {
@@ -857,6 +867,12 @@ class JSGenerator {
             this.currentFrame.variableInputs = this.compareVariableTypes(this.currentFrame.variableInputs, frameRepeat.variableInputs);
             break;
         }
+        case 'event.broadcast':
+            this.resetVariableInputs();
+            break;
+        case 'event.broadcastAndWait':
+            this.resetVariableInputs();
+            break;
         case 'procedures.call': {
             this.resetVariableInputs();
             break;
@@ -1025,7 +1041,9 @@ class JSGenerator {
             break;
         }
         case 'control.waitUntil': {
-            this.resetVariableInputs();
+            if (this.warpTimer || !this.isWarp) {
+                this.resetVariableInputs();
+            }
             this.source += `while (!${this.descendInput(node.condition).asBoolean()}) {\n`;
             this.yieldStuckOrNotWarp();
             this.source += `}\n`;
@@ -1350,6 +1368,12 @@ class JSGenerator {
             return frame;
         }
 
+        if (this.branchTypeMap.has(nodes)) {
+            // TODO: Not checking the current frame MAY
+            // have issues -- Unclear how
+            return this.branchTypeMap.get(nodes);
+        }
+
         this.pushFrame(frame);
 
         for (let i = 0; i < nodes.length; i++) {
@@ -1357,7 +1381,9 @@ class JSGenerator {
             this.descendStackedBlockType(nodes[i]);
         }
 
-        return this.popFrame();
+        const resultFrame = this.popFrame();
+        this.branchTypeMap.set(nodes, resultFrame);
+        return resultFrame;
     }
 
     descendStack (nodes, frame) {
