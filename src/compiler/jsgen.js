@@ -73,6 +73,10 @@ class TypedInput {
         this.type = type;
     }
 
+    clone () {
+        return new TypedInput(this.source, this.type);
+    }
+
     asNumber () {
         if (this.type === TYPE_NUMBER) return this.source;
         if (this.type === TYPE_NUMBER_NAN) return `(${this.source} || 0)`;
@@ -90,7 +94,7 @@ class TypedInput {
     }
 
     asBoolean () {
-        if (this.type === TYPE_BOOLEAN) return this.source;
+        if (this.type === TYPE_BOOLEAN || this.type === TYPE_NUMBER) return this.source;
         return `toBoolean(${this.source})`;
     }
 
@@ -126,6 +130,10 @@ class ConstantInput {
     constructor (constantValue, safe) {
         this.constantValue = constantValue;
         this.safe = safe;
+    }
+
+    clone () {
+        return new ConstantInput(this.constantValue, this.safe);
     }
 
     asNumber () {
@@ -221,6 +229,17 @@ class VariableInput {
         this._value = null;
     }
 
+    clone () {
+        const clone = new VariableInput(this.source);
+        clone.type = this.type;
+
+        if (this._value) {
+            clone._value = this._value.clone();
+        }
+
+        return clone;
+    }
+
     /**
      * @param {Input} input The input this variable was most recently set to.
      */
@@ -240,7 +259,23 @@ class VariableInput {
         if (input instanceof TypedInput) {
             this.type = input.type;
         } else {
-            this.type = TYPE_UNKNOWN;
+            if (input instanceof ConstantInput) {
+                if (typeof input.constantValue === "number") {
+                    if (Number.isNaN(input.constantValue)) {
+                        this.type = TYPE_NUMBER_NAN;
+                    } else {
+                        this.type = TYPE_NUMBER;
+                    }
+                } else if (typeof input.constantValue === "string") {
+                    this.type = TYPE_STRING;
+                } else if (typeof input.constantValue === "boolean") {
+                    this.type = TYPE_BOOLEAN;
+                } else {
+                    // Sanity check -- Should never occur
+                    // Means typeof input is "object" or "undefined"
+                    this.type = TYPE_UNKNOWN;
+                }
+            }
         }
     }
 
@@ -261,7 +296,7 @@ class VariableInput {
     }
 
     asBoolean () {
-        if (this.type === TYPE_BOOLEAN) return this.source;
+        if (this.type === TYPE_BOOLEAN || this.type === TYPE_NUMBER) return this.source;
         return `toBoolean(${this.source})`;
     }
 
@@ -281,14 +316,16 @@ class VariableInput {
         if (this._value) {
             return this._value.isAlwaysNumber();
         }
-        return false;
+        return this.type === TYPE_NUMBER;
+//        return false;
     }
 
     isAlwaysNumberOrNaN () {
         if (this._value) {
             return this._value.isAlwaysNumberOrNaN();
         }
-        return false;
+        return this.type === TYPE_NUMBER || this.type === TYPE_NUMBER_NAN;
+//        return false;
     }
 
     isNeverNumber () {
@@ -329,13 +366,19 @@ const isSafeConstantForEqualsOptimization = input => {
  * A frame contains some information about the current substack being compiled.
  */
 class Frame {
-    constructor (isLoop) {
+    constructor (isLoop, variableInputs) {
         /**
          * Whether the current stack runs in a loop (while, for)
          * @type {boolean}
          * @readonly
          */
         this.isLoop = isLoop;
+
+        /**
+         * The type and sources of variables
+         * @type {Object.<string, VariableInput>[]}
+         */
+        this.variableInputs = variableInputs;
 
         /**
          * Whether the current block is the last block in the stack.
@@ -356,11 +399,6 @@ class JSGenerator {
         this.ir = ir;
         this.target = target;
         this.source = '';
-
-        /**
-         * @type {Object.<string, VariableInput>}
-         */
-        this.variableInputs = {};
 
         this.isWarp = script.isWarp;
         this.isProcedure = script.isProcedure;
@@ -390,6 +428,56 @@ class JSGenerator {
     }
 
     /**
+     * Clones the VariableInputs of a frame
+     * @param {VariableInput[]} inputs List of inputs to clone.
+     */
+    cloneVariableInputs (inputs) {
+        const clone = {};
+
+        for (const input in inputs) {
+            clone[input] = inputs[input].clone();
+        }
+
+        return clone;
+    }
+
+    compareVariableTypes (inputs1, inputs2) {
+        const clone = {};
+
+        for (const input in inputs1) {
+            if (input in inputs2) {
+                const type1 = inputs1[input].type;
+                const type2 = inputs2[input].type;
+
+                if (type1 === TYPE_UNKNOWN || type2 === TYPE_UNKNOWN) {
+                    // One of the types are unknown -- Don't try to guess
+                    continue;
+                }
+
+                if (type1 === type2) {
+                    // Could choose either
+                    clone[input] = inputs1[input];
+                    continue;
+                }
+
+                if (type1 === TYPE_NUMBER && type2 === TYPE_NUMBER_NAN) {
+                    clone[input] = inputs2[input];
+                    continue;
+                }
+
+                if (type1 === TYPE_NUMBER_NAN && type2 === TYPE_NUMBER) {
+                    clone[input] = inputs1[input];
+                    continue;
+                }
+
+                // Don't acknowledge variable type
+            }
+        }
+
+        return clone;
+    }
+
+    /**
      * Enter a new frame
      * @param {Frame} frame New frame.
      */
@@ -402,8 +490,10 @@ class JSGenerator {
      * Exit the current frame
      */
     popFrame () {
-        this.frames.pop();
+        const usedFrame = this.frames.pop();
         this.currentFrame = this.frames[this.frames.length - 1];
+
+        return usedFrame;
     }
 
     /**
@@ -709,6 +799,79 @@ class JSGenerator {
     }
 
     /**
+     * Descends
+     * @param {*} node Stacked node to update types for.
+     */
+    descendStackedBlockType (node) {
+        // We already know we're not in a loop/are not yielding
+        switch (node.kind) {
+        case 'control.for': {
+            const clone = this.cloneVariableInputs(this.currentFrame.variableInputs);
+            const frameClone = new Frame(true, clone);
+            this.pushFrame(frameClone);
+            this.descendVariable(node.variable).type = TYPE_NUMBER;
+            this.popFrame();
+            
+            this.descendStackType(node.do, frameClone);
+
+            this.currentFrame.variableInputs = this.compareVariableTypes(this.currentFrame.variableInputs, frameClone.variableInputs);
+            break;
+        }
+        case 'control.if': {
+            const cloneTrue = this.cloneVariableInputs(this.currentFrame.variableInputs);
+            const frameTrue = this.descendStackType(node.whenTrue, new Frame(false, cloneTrue));
+            // only add the else branch if it won't be empty
+            // this makes scripts have a bit less useless noise in them
+
+            let frameFalse = null;
+            if (node.whenFalse.length) {
+                const cloneFalse = this.cloneVariableInputs(this.currentFrame.variableInputs);
+                frameFalse = this.descendStackType(node.whenFalse, new Frame(false, cloneFalse));
+            } else {
+                frameFalse = this.currentFrame;
+            }
+
+            this.currentFrame.variableInputs = this.compareVariableTypes(frameTrue.variableInputs, frameFalse.variableInputs);
+            break;
+        }
+        case 'control.repeat': {
+            const clone = this.cloneVariableInputs(this.currentFrame.variableInputs);
+            const frameRepeat = this.descendStackType(node.do, new Frame(true, clone));
+
+            this.currentFrame.variableInputs = this.compareVariableTypes(this.currentFrame.variableInputs, frameRepeat.variableInputs);
+            break;
+        }
+        case 'control.wait': {
+            // Can yield, but shouldn't ever
+            break;
+        }
+        case 'control.waitUntil': {
+            // Same as control.wait -- Can yield,
+            // but we shouldn't ever get here if it does
+            break;
+        }
+        case 'control.while': {
+            const clone = this.cloneVariableInputs(this.currentFrame.variableInputs);
+            const frameRepeat = this.descendStackType(node.do, new Frame(true, clone));
+
+            this.currentFrame.variableInputs = this.compareVariableTypes(this.currentFrame.variableInputs, frameRepeat.variableInputs);
+            break;
+        }
+        case 'procedures.call': {
+            this.resetVariableInputs();
+            break;
+        }
+        case 'var.set': {
+            const variable = this.descendVariable(node.variable);
+            const value = this.descendInput(node.value);
+
+            variable.setInput(value);
+            break;
+        }
+        }
+    }
+
+    /**
      * @param {*} node Stacked node to compile.
      */
     descendStackedBlock (node) {
@@ -743,32 +906,93 @@ class JSGenerator {
             this.source += '}\n';
             break;
         case 'control.for': {
-            this.resetVariableInputs();
-            const index = this.localVariables.next();
-            this.source += `var ${index} = 0; `;
-            this.source += `while (${index} < ${this.descendInput(node.count).asNumber()}) { `;
-            this.source += `${index}++; `;
-            this.source += `${this.referenceVariable(node.variable)}.value = ${index};\n`;
-            this.descendStack(node.do, new Frame(true));
-            this.yieldLoop();
-            this.source += '}\n';
+            if (this.warpTimer || !this.isWarp) {
+                // Yields, reset variable inputs
+                this.resetVariableInputs();
+                const index = this.localVariables.next();
+                this.source += `var ${index} = 0; `;
+                this.source += `while (${index} < ${this.descendInput(node.count).asNumber()}) { `;
+                this.source += `${index}++; `;
+                this.source += `${this.referenceVariable(node.variable)}.value = ${index};\n`;
+                this.descendStack(node.do, new Frame(true));
+                this.yieldLoop();
+                this.source += '}\n';
+            } else {
+                // Clone current frame, acknowledge that
+                // the index variable is a number
+                const cloneInputs = this.cloneVariableInputs(this.currentFrame.variableInputs);
+                const cloneFrame = new Frame(true, cloneInputs);
+                this.pushFrame(cloneFrame);
+                this.descendVariable(node.variable).type = TYPE_NUMBER;
+                this.popFrame();
+
+                // Compute and update the types for inside and outside
+                // of the loop the agree with eachother
+                const resultFrame = this.descendStackType(node.do, cloneFrame);
+                const adjustedInputs = this.compareVariableTypes(resultFrame.variableInputs, this.currentFrame.variableInputs);
+
+                const adjustedClone = this.cloneVariableInputs(adjustedInputs);
+                const adjustedCloneFrame = new Frame(true, adjustedClone);
+
+                const index = this.localVariables.next();
+                this.source += `var ${index} = 0; `;
+
+                // Initialize the loop condition, and once again
+                // note that the index variable is a number
+                // at the start of the loop
+                this.pushFrame(adjustedCloneFrame);
+                this.source += `while (${index} < ${this.descendInput(node.count).asNumber()}) { `;
+                this.source += `${index}++; `;
+                this.source += `${this.referenceVariable(node.variable)}.value = ${index};\n`;
+                this.descendVariable(node.variable).type = TYPE_NUMBER;
+                this.popFrame();
+
+                // Descend through the substack and update
+                // the current variables to the expected values
+                this.descendStack(node.do, adjustedCloneFrame);
+                this.currentFrame.variableInputs = adjustedInputs;
+
+                // It can be ensured there will be no yielding
+                this.source += '}\n';
+            }
             break;
         }
         case 'control.if':
             this.source += `if (${this.descendInput(node.condition).asBoolean()}) {\n`;
-            this.descendStack(node.whenTrue, new Frame(false));
+            
+            const cloneTrue = this.cloneVariableInputs(this.currentFrame.variableInputs);
+            const frameTrue = this.descendStack(node.whenTrue, new Frame(false, cloneTrue));
+
             // only add the else branch if it won't be empty
             // this makes scripts have a bit less useless noise in them
+            // If the branch is empty, the variable types will not
+            // change
+            let frameFalse = null;
             if (node.whenFalse.length) {
                 this.source += `} else {\n`;
-                this.descendStack(node.whenFalse, new Frame(false));
+                const cloneFalse = this.cloneVariableInputs(this.currentFrame.variableInputs);
+                frameFalse = this.descendStack(node.whenFalse, new Frame(false, cloneFalse));
+            } else {
+                frameFalse = this.currentFrame;
             }
+
+            // Update variable types to comply
+            this.currentFrame.variableInputs = this.compareVariableTypes(frameTrue.variableInputs, frameFalse.variableInputs);
             this.source += `}\n`;
             break;
         case 'control.repeat': {
+            // Look through the loop types and
+            // adjust all variable types to comply
+            const cloneTest = this.cloneVariableInputs(this.currentFrame.variableInputs);
+            const resultFrame = this.descendStackType(node.do, new Frame(true, cloneTest));
+            const adjustedInputs = this.compareVariableTypes(resultFrame.variableInputs, this.currentFrame.variableInputs);
+
+            const cloneLoop = this.cloneVariableInputs(adjustedInputs);
             const i = this.localVariables.next();
             this.source += `for (var ${i} = ${this.descendInput(node.times).asNumber()}; ${i} >= 0.5; ${i}--) {\n`;
-            this.descendStack(node.do, new Frame(true));
+            this.descendStack(node.do, new Frame(true, cloneLoop));
+            this.currentFrame.variableInputs = adjustedInputs;
+
             this.yieldLoop();
             this.source += `}\n`;
             break;
@@ -808,9 +1032,23 @@ class JSGenerator {
             break;
         }
         case 'control.while':
-            this.resetVariableInputs();
+            // Look through the loop types and
+            // adjust all variable types to comply
+            const cloneTest = this.cloneVariableInputs(this.currentFrame.variableInputs);
+            const resultFrame = this.descendStackType(node.do, new Frame(true, cloneTest));
+            const adjustedInputs = this.compareVariableTypes(resultFrame.variableInputs, this.currentFrame.variableInputs);
+
+            const cloneLoop = this.cloneVariableInputs(adjustedInputs);
+            const loopFrame = new Frame(true, cloneLoop);
+            // It's required that the compliant types
+            // are noted in the condition
+            this.pushFrame(loopFrame);
             this.source += `while (${this.descendInput(node.condition).asBoolean()}) {\n`;
-            this.descendStack(node.do, new Frame(true));
+            this.popFrame();
+
+            this.descendStack(node.do, loopFrame);
+            this.currentFrame.variableInputs = adjustedInputs;
+            
             if (node.warpTimer) {
                 this.yieldStuckOrNotWarp();
             } else {
@@ -1101,13 +1339,30 @@ class JSGenerator {
     }
 
     resetVariableInputs () {
-        this.variableInputs = {};
+        this.currentFrame.variableInputs = {};
+    }
+
+    descendStackType (nodes, frame) {
+        if (frame.isLoop && (this.warpTimer || !this.isWarp)) {
+            // Will guarenteed generate a yield where
+            // variable types may be overwritten
+            this.resetVariableInputs();
+            return frame;
+        }
+
+        this.pushFrame(frame);
+
+        for (let i = 0; i < nodes.length; i++) {
+            frame.isLastBlock = i === nodes.length - 1;
+            this.descendStackedBlockType(nodes[i]);
+        }
+
+        return this.popFrame();
     }
 
     descendStack (nodes, frame) {
         // Entering a stack -- all bets are off.
         // TODO: allow if/else to inherit values
-        this.resetVariableInputs();
         this.pushFrame(frame);
 
         for (let i = 0; i < nodes.length; i++) {
@@ -1117,16 +1372,15 @@ class JSGenerator {
 
         // Leaving a stack -- any assumptions made in the current stack do not apply outside of it
         // TODO: in if/else this might create an extra unused object
-        this.resetVariableInputs();
-        this.popFrame();
+        return this.popFrame();
     }
 
     descendVariable (variable) {
-        if (this.variableInputs.hasOwnProperty(variable.id)) {
-            return this.variableInputs[variable.id];
+        if (this.currentFrame.variableInputs.hasOwnProperty(variable.id)) {
+            return this.currentFrame.variableInputs[variable.id];
         }
         const input = new VariableInput(`${this.referenceVariable(variable)}.value`);
-        this.variableInputs[variable.id] = input;
+        this.currentFrame.variableInputs[variable.id] = input;
         return input;
     }
 
@@ -1301,7 +1555,7 @@ class JSGenerator {
      */
     compile () {
         if (this.script.stack) {
-            this.descendStack(this.script.stack, new Frame(false));
+            this.descendStack(this.script.stack, new Frame(false, {}));
         }
 
         const factory = this.createScriptFactory();
